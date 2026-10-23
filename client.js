@@ -971,7 +971,7 @@ window.__ModuleLoader__.load({
 
     // -------------------------------------------------------------- cards
 
-    function TaskCard({ task, now, pending, onToggle, onRun, onDelete }) {
+    function TaskCard({ task, now, t, pending, onToggle, onRun, onDelete }) {
       const disabled = task.enabled !== true
       return h(
         'article',
@@ -1339,6 +1339,7 @@ window.__ModuleLoader__.load({
                         key: task.id,
                         task,
                         now,
+                        t,
                         pending: pendingId === task.id,
                         onToggle: () => void toggle(task),
                         onRun: () => void runNow(task),
