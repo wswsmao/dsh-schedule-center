@@ -1,0 +1,4 @@
+- insert:
+    - id: schedule-center
+      name: '@local/dsh-schedule-center'
+      config: {}
