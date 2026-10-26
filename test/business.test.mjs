@@ -29,7 +29,9 @@ async function fixture(t, seed = null) {
       async prompt(request) { sessionCalls.push({ method: 'prompt', request }); return { accepted: true } },
     },
   }
-  const center = apply(ctx, { dataDir: dir })
+  const returned = apply(ctx, { dataDir: dir })
+  assert.equal(returned, undefined) // Cordis apply effects cannot return an arbitrary service object.
+  const center = ctx.scheduleCenter
   await center.ready
   t.after(async () => { for (const dispose of effects.reverse()) await dispose(); await rm(dir, { recursive: true, force: true }) })
   return { ctx, center, dir, sessionCalls, listeners, registeredTools, effects }

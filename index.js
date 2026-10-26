@@ -616,7 +616,6 @@ export function apply(ctx, config = {}) {
 
   center.ready = load()
   center.ready.catch((error) => console.error('[schedule-center] initialization failed:', error))
-  return center
 }
 
 /** One HTTP failure the route turns into a JSON response. */
