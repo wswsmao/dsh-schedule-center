@@ -174,6 +174,19 @@ test('agent tool exposes registered business task creation but cannot select per
   await assert.rejects(() => f.center.createTask({ type: 'prompt', name: 'unsafe', prompt: 'x', cwd: f.dir, schedule: later(), permission: 'danger-full-access' }), { code: 'permission_user_only' })
 })
 
+test('late provider status cannot overwrite a concurrently cancelled terminal', async (t) => {
+  const f = await fixture(t)
+  let release, statusEntered
+  const entered = new Promise((resolve) => { statusEntered = resolve })
+  const a = action({ async status() { statusEntered(); return new Promise((resolve) => { release = resolve }) } })
+  f.center.registerAction(a.definition)
+  const task = await newBusiness(f); const { run } = await f.center.runTask(task.id)
+  const checking = f.center.tick(); await entered
+  await f.center.cancelRun(run.id)
+  release({ status: 'running' }); await checking
+  assert.equal(run.status, 'cancelled'); assert.equal(f.center.readTask(task.id).running, false)
+})
+
 test('stable occurrence keys distinguish scheduled and manual runs', () => {
   assert.equal(occurrenceKey('task', 'schedule', 0, ''), 'schedule-center:task:1970-01-01T00:00:00.000Z')
   assert.notEqual(occurrenceKey('task', 'manual', null, 'one'), occurrenceKey('task', 'manual', null, 'two'))
