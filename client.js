@@ -22,7 +22,29 @@ window.__ModuleLoader__.load({
     const zh = {
       'meta.locale': 'zh-CN',
       'panel': '定时任务',
-      'page.subtitle': '按计划在你的工作空间里自动运行提示词。',
+      'page.subtitle': '按计划运行提示词或已注册的固定业务。',
+      'dialog.type': '任务类型',
+      'dialog.type.prompt': '提示词任务',
+      'dialog.type.business': '固定业务任务',
+      'dialog.businessAction': '业务动作',
+      'dialog.businessEmpty': '没有可用的业务动作，请先启用对应插件。',
+      'dialog.businessNote': '直接调用固定业务，不经过模型提示词；权限与发布授权由业务插件自行校验。',
+      'dialog.error.action': '请选择已注册的业务动作。',
+      'card.business': '固定业务：{action}',
+      'card.actionUnavailable': '业务动作暂不可用',
+      'run.status.complete': '完成',
+      'run.status.partial': '部分完成',
+      'run.status.failed': '失败',
+      'run.status.cancelled': '已取消',
+      'run.status.blocked': '需处理',
+      'run.status.interrupted': '已中断',
+      'run.status.starting': '启动中',
+      'run.status.queued': '排队中',
+      'run.status.cancelling': '取消中',
+      'run.openReport': '打开日报',
+      'run.businessId': '业务运行：{id}',
+      'run.cancel': '取消运行',
+      'notice.cancelled': '已请求取消业务运行',
       'tab.tasks': '定时任务',
       'tab.runs': '运行记录',
       'new.action': '新建',
@@ -124,7 +146,29 @@ window.__ModuleLoader__.load({
     const en = {
       'meta.locale': 'en-US',
       'panel': 'Scheduled tasks',
-      'page.subtitle': 'Run prompts automatically in your workspace on a schedule.',
+      'page.subtitle': 'Run prompts or registered fixed business actions on a schedule.',
+      'dialog.type': 'Task type',
+      'dialog.type.prompt': 'Prompt task',
+      'dialog.type.business': 'Fixed business task',
+      'dialog.businessAction': 'Business action',
+      'dialog.businessEmpty': 'No business action is available. Enable its provider plugin first.',
+      'dialog.businessNote': 'Calls the registered action directly without a model prompt. Its provider validates permissions and publishing authority.',
+      'dialog.error.action': 'Choose a registered business action.',
+      'card.business': 'Fixed business: {action}',
+      'card.actionUnavailable': 'Business action temporarily unavailable',
+      'run.status.complete': 'Complete',
+      'run.status.partial': 'Partial',
+      'run.status.failed': 'Failed',
+      'run.status.cancelled': 'Cancelled',
+      'run.status.blocked': 'Needs attention',
+      'run.status.interrupted': 'Interrupted',
+      'run.status.starting': 'Starting',
+      'run.status.queued': 'Queued',
+      'run.status.cancelling': 'Cancelling',
+      'run.openReport': 'Open report',
+      'run.businessId': 'Business run: {id}',
+      'run.cancel': 'Cancel run',
+      'notice.cancelled': 'Business cancellation requested',
       'tab.tasks': 'Scheduled tasks',
       'tab.runs': 'Run records',
       'new.action': 'New',
@@ -527,6 +571,10 @@ window.__ModuleLoader__.load({
       return option?.name ?? permission ?? t('common.auto')
     }
 
+    function safeReportUrl(value) {
+      try { const u = new URL(value); return ['http:', 'https:'].includes(u.protocol) && !u.username && !u.password ? u.href : undefined } catch { return undefined }
+    }
+
     function basename(path) {
       if (typeof path !== 'string' || path === '') return ''
       const parts = path.split(/[\\/]+/).filter(Boolean)
@@ -633,12 +681,15 @@ window.__ModuleLoader__.load({
       return ref
     }
 
-    function NewTaskDialog({ t, workspaces, permissions, onClose, onCreated }) {
+    function NewTaskDialog({ t, workspaces, permissions, businessActions, onClose, onCreated }) {
       const open = true
       const ref = useModal(open)
       const nameRef = useRef(null)
       const [name, setName] = useState('')
       const [prompt, setPrompt] = useState('')
+      const [taskType, setTaskType] = useState('prompt')
+      const [actionId, setActionId] = useState(() => businessActions?.[0]?.id ?? '')
+      const chosenAction = businessActions?.find((entry) => entry.id === actionId)
       const [target, setTarget] = useState(() => {
         const first = Array.isArray(workspaces) && workspaces.length > 0 ? workspaces[0] : null
         return first === null ? { kind: 'custom', cwd: '' } : { kind: 'workspace', id: first.id, cwd: first.path, title: first.title }
@@ -688,8 +739,12 @@ window.__ModuleLoader__.load({
           setError(t('dialog.error.name'))
           return
         }
-        if (prompt.trim() === '') {
+        if (taskType === 'prompt' && prompt.trim() === '') {
           setError(t('dialog.error.prompt'))
+          return
+        }
+        if (taskType === 'business' && !chosenAction) {
+          setError(t('dialog.error.action'))
           return
         }
         if (target.kind === 'custom' && (typeof target.cwd !== 'string' || target.cwd === '')) {
@@ -726,10 +781,12 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
               name: name.trim(),
-              prompt,
+              type: taskType,
+              actionId: taskType === 'business' ? actionId : undefined,
+              prompt: taskType === 'prompt' ? prompt : undefined,
               workspaceId: target.kind === 'workspace' ? target.id : undefined,
               cwd: target.kind === 'custom' ? target.cwd : undefined,
-              permission,
+              permission: taskType === 'prompt' ? permission : undefined,
               enabled,
               schedule,
             }),
@@ -778,16 +835,29 @@ window.__ModuleLoader__.load({
             'aria-label': t('dialog.namePlaceholder'),
             maxLength: 120,
           }),
+          h('label', { className: 'dsc-field' },
+            h('span', { className: 'dsc-field-label' }, t('dialog.type')),
+            h('span', { className: 'dsc-control' }, h('select', {
+              value: taskType, onChange: (event) => setTaskType(event.target.value), 'aria-label': t('dialog.type'),
+            }, h('option', { value: 'prompt' }, t('dialog.type.prompt')), h('option', { value: 'business' }, t('dialog.type.business')))),
+          ),
+          taskType === 'business' ? h('label', { className: 'dsc-field' },
+            h('span', { className: 'dsc-field-label' }, t('dialog.businessAction')),
+            h('span', { className: 'dsc-control' }, h('select', {
+              value: actionId, onChange: (event) => setActionId(event.target.value), 'aria-label': t('dialog.businessAction'),
+            }, (businessActions?.length ? businessActions : [{ id: '', title: t('dialog.businessEmpty') }]).map((entry) => h('option', { key: entry.id, value: entry.id }, entry.title)))),
+            h('p', { className: 'dsc-dialog-note' }, chosenAction?.description || t('dialog.businessNote')),
+          ) : null,
           h(
             'div',
-            { className: 'dsc-prompt-box' },
-            h('textarea', {
+            { className: 'dsc-prompt-box', style: taskType === 'business' ? { minHeight: 0 } : undefined },
+            taskType === 'prompt' ? h('textarea', {
               value: prompt,
               onChange: (event) => setPrompt(event.target.value),
               placeholder: t('dialog.promptPlaceholder'),
               'aria-label': t('dialog.promptPlaceholder'),
               rows: 6,
-            }),
+            }) : null,
             h(
               'div',
               { className: 'dsc-prompt-tools' },
@@ -805,7 +875,7 @@ window.__ModuleLoader__.load({
                   h('option', { value: '__custom' }, t('dialog.workspaceCustom')),
                 ),
               ),
-              h(
+              taskType === 'prompt' ? h(
                 'span',
                 { className: 'dsc-pill', 'data-warn': permission === 'danger-full-access' ? 'true' : 'false', title: t('dialog.permission') },
                 h(IconWarning),
@@ -817,7 +887,7 @@ window.__ModuleLoader__.load({
                     h('option', { key: option.value, value: option.value }, permissionLabel(option.value, permissions.options, t)),
                   ),
                 ),
-              ),
+              ) : null,
             ),
           ),
           h(
@@ -1022,7 +1092,7 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
-        h('p', { className: 'dsc-card-prompt' }, task.prompt || t('card.promptEmpty')),
+        h('p', { className: 'dsc-card-prompt' }, task.type === 'business' ? t('card.business', { action: task.actionTitle || task.actionId }) + (task.actionAvailable === false ? ` · ${t('card.actionUnavailable')}` : '') : task.prompt || t('card.promptEmpty')),
         h(
           'div',
           { className: 'dsc-card-foot' },
@@ -1032,12 +1102,14 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function RunRow({ run, t, onOpenSession }) {
-      const status = run.status === 'success' || run.status === 'error' || run.status === 'running' ? run.status : 'error'
+    function RunRow({ run, t, onOpenSession, onCancel }) {
+      const known = ['success', 'error', 'running', 'complete', 'partial', 'failed', 'cancelled', 'blocked', 'interrupted', 'starting', 'queued', 'cancelling']
+      const status = known.includes(run.status) ? run.status : 'error'
+      const tone = status === 'complete' || status === 'success' ? 'success' : ['running', 'starting', 'queued', 'cancelling'].includes(status) ? 'running' : 'error'
       return h(
         'div',
         { className: 'dsc-run' },
-        h('span', { className: 'dsc-dot', 'data-status': status }),
+        h('span', { className: 'dsc-dot', 'data-status': tone }),
         h(
           'div',
           { className: 'dsc-run-main' },
@@ -1052,15 +1124,21 @@ window.__ModuleLoader__.load({
             { className: 'dsc-run-meta' },
             h('span', null, formatRunTime(run.startedAt, t)),
             h('span', null, durationText(run.startedAt, run.finishedAt, t)),
-            h('span', { className: 'dsc-badge', 'data-tone': status }, t(`run.status.${status}`)),
+            h('span', { className: 'dsc-badge', 'data-tone': tone }, t(`run.status.${status}`)),
           ),
+          run.businessRunId ? h('p', { className: 'dsc-run-summary', title: run.businessRunId }, t('run.businessId', { id: run.businessRunId })) : null,
           run.summary === null || run.summary === undefined ? null : h('p', { className: 'dsc-run-summary' }, run.summary),
           run.error === null || run.error === undefined ? null : h('p', { className: 'dsc-run-summary', style: { color: 'var(--dsw-alias-state-error-primary)' } }, run.error),
         ),
         h(
           'div',
           { className: 'dsc-run-side' },
-          run.sessionId === null || run.sessionId === undefined
+          run.type === 'business'
+            ? h(React.Fragment, null,
+                run.reportUrl ? h('a', { className: 'dsc-btn', 'data-variant': 'outline', href: safeReportUrl(run.reportUrl), target: '_blank', rel: 'noopener noreferrer' }, t('run.openReport')) : null,
+                ['running', 'starting', 'queued'].includes(status) ? h('button', { type: 'button', className: 'dsc-btn', 'data-variant': 'outline', onClick: () => onCancel(run) }, t('run.cancel')) : null,
+              )
+            : run.sessionId === null || run.sessionId === undefined
             ? h('span', { className: 'dsc-muted', style: { fontSize: '12.5px' } }, t('run.noSession'))
             : h(
                 'button',
@@ -1096,6 +1174,7 @@ window.__ModuleLoader__.load({
       const runs = useMemo(() => (Array.isArray(data?.runs) ? data.runs : []), [data])
       const workspaces = useMemo(() => (Array.isArray(data?.workspaces) ? data.workspaces : []), [data])
       const permissions = data?.permissions
+      const businessActions = useMemo(() => (Array.isArray(data?.businessActions) ? data.businessActions : []), [data])
 
       const counts = useMemo(
         () => ({
@@ -1114,7 +1193,8 @@ window.__ModuleLoader__.load({
             (task) =>
               query === '' ||
               task.name.toLowerCase().includes(query) ||
-              String(task.prompt).toLowerCase().includes(query),
+              String(task.prompt).toLowerCase().includes(query) ||
+              String(task.actionTitle ?? task.actionId ?? '').toLowerCase().includes(query),
           )
           .slice()
           .sort((left, right) => {
@@ -1158,6 +1238,14 @@ window.__ModuleLoader__.load({
         [run, t],
       )
 
+      const cancelBusiness = useCallback(async (entry) => {
+        try {
+          await requestJson(`/runs/${encodeURIComponent(entry.id)}/cancel`, { method: 'POST' })
+          setNotice({ kind: 'success', text: t('notice.cancelled') })
+          await snapshot.reload()
+        } catch (error) { setNotice({ kind: 'error', text: error instanceof Error ? error.message : t('error.action') }) }
+      }, [snapshot, t])
+
       const confirmDelete = useCallback(async () => {
         const task = deleteTarget
         if (task === null) return
@@ -1185,10 +1273,11 @@ window.__ModuleLoader__.load({
           t,
           workspaces,
           permissions,
+          businessActions,
           onClose: () => setDialogOpen(false),
           onCreated: { afterCreate: created, pickDirectory },
         }),
-        [t, workspaces, permissions, created, pickDirectory],
+        [t, workspaces, permissions, businessActions, created, pickDirectory],
       )
 
       const tabs = [
@@ -1370,6 +1459,7 @@ window.__ModuleLoader__.load({
                             run: entry,
                             t,
                             onOpenSession: (sessionId) => openSession(sessionId),
+                            onCancel: cancelBusiness,
                           }),
                         ),
                       ),

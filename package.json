@@ -2,7 +2,7 @@
   "name": "@local/dsh-schedule-center",
   "version": "1.0.0",
   "private": true,
-  "description": "Left-sidebar scheduled tasks for DeepSeek Harness: create a task with a prompt and workspace, run it on a schedule, and review run records.",
+  "description": "Left-sidebar scheduled tasks for DeepSeek Harness: run prompts or registered fixed business actions and review their real terminal states.",
   "type": "module",
   "license": "MIT",
   "exports": {
@@ -18,8 +18,11 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "test/*.mjs",
+    ".gitignore"
   ],
+  "scripts": { "test": "node --test test/*.test.mjs" },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

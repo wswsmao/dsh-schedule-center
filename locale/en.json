@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Scheduled Tasks",
-    "description": "Run prompts on a schedule from the left sidebar: choose a workspace and permission, then review each run and its conversation."
+    "description": "Run prompts or registered fixed business actions from the left sidebar, choose a project workspace, and review conversations or real business terminal states."
   }
 }
