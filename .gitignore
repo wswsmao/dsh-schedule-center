@@ -5,6 +5,7 @@ pnpm-lock.yaml
 
 # Local runtime data (the Host stores tasks under $DSH_HOME/schedule-center)
 .dsh-data/
+.runtime/
 state.json
 *.tmp
 *.corrupt-*

@@ -14,12 +14,14 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { ScheduleInputError, nextOccurrence, normalizeSchedule, readStoredSchedule } from './lib/schedule.js'
+import { BUSINESS_ACTIVE, BUSINESS_TERMINAL, BusinessActionCatalog, BusinessActionError, BusinessRuns, occurrenceKey } from './lib/business.js'
+import { createScheduleTools } from './lib/tools.js'
 
 /** Cordis plugin name. */
 export const name = 'schedule-center'
 
 /** Host services this plugin needs: the route carrier, the trust fence, sessions. */
-export const inject = ['webServer', 'connection', 'sessionController', 'sessions']
+export const inject = ['webServer', 'connection', 'sessionController', 'sessions', 'tools']
 
 /** Mounted route prefix; every endpoint lives below it. */
 const ROUTE_PREFIX = '/plugins/schedule-center'
@@ -36,7 +38,7 @@ const MAX_RUNS = 200
 /** A run whose turn never ended is reported as failed after this long. */
 const STALE_RUN_MS = 2 * 60 * 60 * 1000
 
-const STATE_VERSION = 1
+const STATE_VERSION = 2
 
 const FALLBACK_PERMISSIONS = Object.freeze({
   options: [
@@ -50,12 +52,30 @@ const FALLBACK_PERMISSIONS = Object.freeze({
  * Mount the scheduled-tasks service.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  */
-export function apply(ctx) {
-  const dataDir = resolveDataDir()
+export function apply(ctx, config = {}) {
+  const dataDir = typeof config.dataDir === 'string' ? config.dataDir : resolveDataDir()
   const statePath = join(dataDir, 'state.json')
   /** @type {{version: number, tasks: any[], runs: any[]}} */
   let state = { version: STATE_VERSION, tasks: [], runs: [] }
   let loaded = false
+  let disposed = false
+  let ticking = false
+  const catalog = new BusinessActionCatalog()
+  const business = new BusinessRuns({ catalog, state: () => state, taskOf, persist })
+  const center = {
+    registerAction: (definition) => catalog.registerAction(definition),
+    listActions: () => catalog.listActions(),
+    createTask,
+    readTask: (id) => publicTask(requireTask(id)),
+    list: () => snapshot(),
+    runTask: (id) => startRun(requireTask(id), 'manual'),
+    setEnabled,
+    removeTask,
+    cancelRun,
+    tick: runTick,
+    ready: null,
+  }
+  ctx.provide('scheduleCenter', center)
   /** Serializes durable writes so two mutations never interleave. */
   let writes = Promise.resolve()
 
@@ -63,15 +83,14 @@ export function apply(ctx) {
   function persist() {
     const text = JSON.stringify(state, null, 2)
     writes = writes
+      .catch(() => {})
       .then(async () => {
         await mkdir(dataDir, { recursive: true })
         const temporary = `${statePath}.${process.pid}.tmp`
         await writeFile(temporary, text, 'utf8')
         await rename(temporary, statePath)
       })
-      .catch((error) => {
-        console.error('[schedule-center] could not persist state:', error)
-      })
+    writes.catch((error) => console.error('[schedule-center] could not persist state:', error))
     return writes
   }
 
@@ -90,7 +109,10 @@ export function apply(ctx) {
         }
       }
     }
-    for (const task of state.tasks) reconcileTask(task, Date.now())
+    for (const task of state.tasks) {
+      reconcileTask(task, Date.now())
+      if (task.type === 'business') task.running = state.runs.some((run) => run.type === 'business' && run.taskId === task.id && BUSINESS_ACTIVE.has(run.status))
+    }
     loaded = true
     await persist()
   }
@@ -121,14 +143,17 @@ export function apply(ctx) {
   }
 
   function trimRuns() {
-    if (state.runs.length > MAX_RUNS) state.runs.length = MAX_RUNS
+    // Never evict a live business receipt: it is required for recovery and cancellation.
+    const active = state.runs.filter((run) => run.type === 'business' && BUSINESS_ACTIVE.has(run.status))
+    const retained = state.runs.filter((run) => !(run.type === 'business' && BUSINESS_ACTIVE.has(run.status))).slice(0, MAX_RUNS)
+    state.runs = [...active, ...retained].sort((left, right) => right.startedAt - left.startedAt)
   }
 
   /** Mark runs whose turn never settled as failed after the stale window. */
   function sweepStaleRuns(now) {
     let changed = false
     for (const run of state.runs) {
-      if (run.status !== 'running' || typeof run.startedAt !== 'number') continue
+      if (run.type === 'business' || run.status !== 'running' || typeof run.startedAt !== 'number') continue
       if (now - run.startedAt < STALE_RUN_MS) continue
       run.status = 'error'
       run.error = '运行超时（未在 2 小时内结束）'
@@ -147,7 +172,15 @@ export function apply(ctx) {
    * @param {'schedule' | 'manual'} trigger - why the run started.
    * @returns {Promise<{run: any} | {code: string, message: string}>}
    */
-  async function startRun(task, trigger) {
+  async function startRun(task, trigger, occurrence = null) {
+    await center.ready
+    if (disposed) return { code: 'scheduler_unloaded', message: '定时任务插件已停用。' }
+    if (task.type === 'business' && trigger === 'schedule') {
+      const key = occurrenceKey(task.id, trigger, occurrence, '')
+      const previous = state.runs.find((run) => run.type === 'business' && run.occurrenceKey === key)
+      if (previous) return { run: previous, deduplicated: true }
+      if (task.lastOccurrenceKey === key) return { code: 'occurrence_already_started', message: '该定时触发已经记录，不会重复执行。' }
+    }
     if (task.running) return { code: 'task_busy', message: '任务正在运行中，请稍后再试。' }
     const now = Date.now()
     task.running = true
@@ -163,10 +196,27 @@ export function apply(ctx) {
       sessionId: null,
       summary: null,
       error: null,
+      type: task.type ?? 'prompt',
+      actionId: task.type === 'business' ? task.actionId : null,
+      businessRunId: null,
+      projectDir: task.cwd,
+      occurrenceKey: task.type === 'business' ? occurrenceKey(task.id, trigger, occurrence, '') : null,
+      stages: null,
+      reportUrl: null,
+      awaitingAction: false,
+      errorCode: null,
+    }
+    if (task.type === 'business') {
+      if (trigger === 'manual') run.occurrenceKey = occurrenceKey(task.id, trigger, occurrence, run.id)
+      task.lastOccurrenceKey = run.occurrenceKey
     }
     state.runs.unshift(run)
     trimRuns()
     await persist()
+    if (task.type === 'business') {
+      await business.start(run)
+      return { run }
+    }
     try {
       const created = await ctx.sessionController.create(
         task.workspaceId === null ? { cwd: task.cwd } : { workspaceId: task.workspaceId },
@@ -261,6 +311,7 @@ export function apply(ctx) {
       runs: state.runs.slice(0, 100),
       workspaces: workspaceOptions(),
       permissions: permissionCatalog(),
+      businessActions: catalog.listActions(),
     }
   }
 
@@ -270,6 +321,11 @@ export function apply(ctx) {
       id: task.id,
       name: task.name,
       prompt: task.prompt,
+      type: task.type ?? 'prompt',
+      actionId: task.actionId ?? null,
+      actionTitle: task.type === 'business' ? catalog.get(task.actionId)?.title ?? task.actionId : null,
+      actionAvailable: task.type !== 'business' || catalog.get(task.actionId) !== undefined,
+      lastBusinessRunId: task.lastBusinessRunId ?? null,
       workspaceId: task.workspaceId,
       cwd: task.cwd,
       permission: task.permission,
@@ -289,12 +345,19 @@ export function apply(ctx) {
    * @param {Record<string, unknown>} body - parsed request body.
    * @returns {Promise<any>} the stored task.
    */
-  async function createTask(body) {
+  async function createTask(body, { userInterface = false } = {}) {
+    await center.ready
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, '任务定义必须是对象。')
+    const type = body.type === undefined ? 'prompt' : body.type
+    if (type !== 'prompt' && type !== 'business') throw new HttpError(400, '任务类型必须是 prompt 或 business。')
     const taskName = typeof body.name === 'string' ? body.name.trim() : ''
     if (taskName === '') throw new HttpError(400, '请填写任务名称。')
     if (taskName.length > 120) throw new HttpError(400, '任务名称不能超过 120 个字符。')
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
-    if (prompt === '') throw new HttpError(400, '请填写任务提示词。')
+    if (type === 'prompt' && prompt === '') throw new HttpError(400, '请填写任务提示词。')
+    const actionId = type === 'business' && typeof body.actionId === 'string' ? body.actionId : null
+    if (type === 'business' && catalog.get(actionId) === undefined) throw new HttpError(400, '所选固定业务动作未注册或不可用。', 'business_action_unavailable')
+    if (!userInterface && body.permission !== undefined) throw new HttpError(400, '代理工具不能选择或提升任务权限，请在界面中配置。', 'permission_user_only')
     if (prompt.length > 20_000) throw new HttpError(400, '提示词过长。')
 
     const target = await resolveTarget(body)
@@ -303,12 +366,14 @@ export function apply(ctx) {
       throw new HttpError(400, '仅一次任务的时间必须晚于当前时间。')
     }
     const permissions = permissionCatalog()
-    const requested = typeof body.permission === 'string' && body.permission !== '' ? body.permission : permissions.defaultPreset
+    const requested = type === 'business' ? null : typeof body.permission === 'string' && body.permission !== '' ? body.permission : permissions.defaultPreset
     const now = Date.now()
     const task = {
       id: randomUUID(),
       name: taskName,
-      prompt,
+      type,
+      actionId,
+      prompt: type === 'prompt' ? prompt : '',
       workspaceId: target.workspaceId,
       cwd: target.cwd,
       permission: requested,
@@ -320,6 +385,8 @@ export function apply(ctx) {
       lastRunAt: null,
       lastStatus: null,
       lastSessionId: null,
+      lastBusinessRunId: null,
+      lastOccurrenceKey: null,
     }
     state.tasks.unshift(task)
     await persist()
@@ -353,6 +420,36 @@ export function apply(ctx) {
     return { workspaceId: null, cwd }
   }
 
+  async function setEnabled(id, enabled) {
+    await center.ready
+    const task = requireTask(id)
+    if (typeof enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值。')
+    if (enabled) {
+      if (task.schedule.kind === 'once' && Date.parse(task.schedule.at) <= Date.now()) throw new HttpError(400, '仅一次任务的时间已过，无法启用。')
+      task.enabled = true
+      task.nextRunAt = nextOccurrence(task.schedule, Date.now())
+    } else { task.enabled = false; task.nextRunAt = null }
+    await persist()
+    return publicTask(task)
+  }
+
+  async function removeTask(id) {
+    await center.ready
+    const task = requireTask(id)
+    if (task.type === 'business' && task.running) throw new HttpError(409, '请先取消正在运行的业务任务再删除。', 'task_busy')
+    state.tasks = state.tasks.filter((candidate) => candidate.id !== task.id)
+    state.runs = state.runs.filter((candidate) => candidate.taskId !== task.id)
+    await persist()
+    return { removed: true }
+  }
+
+  async function cancelRun(id) {
+    await center.ready
+    const run = state.runs.find((candidate) => candidate.id === id)
+    if (!run) throw new HttpError(404, '运行记录不存在。')
+    return business.cancel(run)
+  }
+
   /** Answer one HTTP request below the plugin's route prefix. */
   async function handleRequest(req, res) {
     const rejection = ctx.connection.requestRejection(req)
@@ -370,27 +467,15 @@ export function apply(ctx) {
       }
       if (req.method === 'POST' && rest === '/tasks') {
         const body = await readJsonBody(req)
-        const task = await createTask(body)
+        const task = await createTask(body, { userInterface: true })
         sendJson(res, 200, { ok: true, task: publicTask(task) })
         return
       }
       const enabledMatch = /^\/tasks\/([^/]+)\/enabled$/.exec(rest)
       if (req.method === 'POST' && enabledMatch !== null) {
         const body = await readJsonBody(req)
-        const task = requireTask(enabledMatch[1])
-        if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是布尔值。')
-        if (body.enabled) {
-          if (task.schedule.kind === 'once' && Date.parse(task.schedule.at) <= Date.now()) {
-            throw new HttpError(400, '仅一次任务的时间已过，无法启用。')
-          }
-          task.enabled = true
-          task.nextRunAt = nextOccurrence(task.schedule, Date.now())
-        } else {
-          task.enabled = false
-          task.nextRunAt = null
-        }
-        await persist()
-        sendJson(res, 200, { ok: true, task: publicTask(task) })
+        const task = await setEnabled(enabledMatch[1], body.enabled)
+        sendJson(res, 200, { ok: true, task })
         return
       }
       const runMatch = /^\/tasks\/([^/]+)\/run$/.exec(rest)
@@ -401,12 +486,15 @@ export function apply(ctx) {
         sendJson(res, 200, { ok: true, run: outcome.run, task: publicTask(task) })
         return
       }
+      const cancelMatch = /^\/runs\/([^/]+)\/cancel$/.exec(rest)
+      if (req.method === 'POST' && cancelMatch !== null) {
+        const run = await cancelRun(decodeURIComponent(cancelMatch[1]))
+        sendJson(res, 200, { ok: true, run })
+        return
+      }
       const deleteMatch = /^\/tasks\/([^/]+)$/.exec(rest)
       if (req.method === 'DELETE' && deleteMatch !== null) {
-        const task = requireTask(deleteMatch[1])
-        state.tasks = state.tasks.filter((candidate) => candidate.id !== task.id)
-        state.runs = state.runs.filter((candidate) => candidate.taskId !== task.id)
-        await persist()
+        await removeTask(deleteMatch[1])
         sendJson(res, 200, { ok: true })
         return
       }
@@ -414,6 +502,10 @@ export function apply(ctx) {
     } catch (error) {
       if (error instanceof HttpError) {
         sendJson(res, error.status, { ok: false, code: error.code, message: error.message })
+        return
+      }
+      if (error instanceof BusinessActionError) {
+        sendJson(res, 409, { ok: false, code: error.code, message: error.message })
         return
       }
       if (error instanceof ScheduleInputError) {
@@ -453,49 +545,56 @@ export function apply(ctx) {
     'schedule-center: JSON API',
   )
 
+  async function runTick() {
+    if (!loaded || disposed || ticking) return
+    ticking = true
+    try {
+      await business.refresh()
+      const now = Date.now()
+      let changed = sweepStaleRuns(now)
+      for (const task of state.tasks) {
+        if (!task.enabled || task.running === true) continue
+        if (typeof task.nextRunAt !== 'number' || !Number.isFinite(task.nextRunAt)) { task.nextRunAt = nextOccurrence(task.schedule, now); changed = true; continue }
+        if (task.nextRunAt > now) continue
+        const occurrence = task.nextRunAt
+        if (task.type === 'business') {
+          // Advance and persist the durable intent in startRun before invoking a provider.
+          if (task.schedule.kind === 'once') { task.enabled = false; task.nextRunAt = null }
+          else task.nextRunAt = nextOccurrence(task.schedule, now)
+          await startRun(task, 'schedule', occurrence)
+        } else {
+          // Preserve the existing prompt-task scheduling path.
+          if (task.schedule.kind === 'once') { task.enabled = false; task.nextRunAt = null }
+          else task.nextRunAt = nextOccurrence(task.schedule, now)
+          void startRun(task, 'schedule').catch((error) => console.error('[schedule-center] prompt run failed:', error))
+        }
+        changed = true
+      }
+      if (changed) await persist()
+    } finally { ticking = false }
+  }
+
   ctx.effect(
     () => {
-      const tick = () => {
-        void (async () => {
-          if (!loaded) return
-          const now = Date.now()
-          let changed = sweepStaleRuns(now)
-          for (const task of state.tasks) {
-            if (!task.enabled || task.running === true) continue
-            if (typeof task.nextRunAt !== 'number' || !Number.isFinite(task.nextRunAt)) {
-              task.nextRunAt = nextOccurrence(task.schedule, now)
-              changed = true
-              continue
-            }
-            if (task.nextRunAt > now) continue
-            // Advance before starting: a crashed run must not replay the same occurrence.
-            if (task.schedule.kind === 'once') {
-              task.enabled = false
-              task.nextRunAt = null
-            } else {
-              task.nextRunAt = nextOccurrence(task.schedule, now)
-            }
-            changed = true
-            void startRun(task, 'schedule')
-          }
-          if (changed) await persist()
-        })()
-      }
+      const tick = () => { void runTick().catch((error) => console.error('[schedule-center] ticker failed:', error)) }
       const timer = ctx.get('timer')
-      if (timer !== undefined && typeof timer.setInterval === 'function') {
-        return timer.setInterval(tick, TICK_MS)
-      }
+      if (timer !== undefined && typeof timer.setInterval === 'function') return timer.setInterval(tick, TICK_MS)
       const handle = setInterval(tick, TICK_MS)
       return () => clearInterval(handle)
     },
     'schedule-center: ticker',
   )
+  ctx.effect(() => () => { disposed = true; return writes.catch(() => {}) }, 'schedule-center: durable shutdown')
+  ctx.effect(() => {
+    const disposers = createScheduleTools(center).map((definition) => ctx.tools.register(definition))
+    return () => { for (const dispose of disposers.reverse()) dispose() }
+  }, 'schedule-center: agent tools')
 
   ctx.on('session/event', (session, event) => {
     if (event === undefined || (event.type !== 'assistant/message' && event.type !== 'turn/end')) return
     const sessionId = session?.id
     if (typeof sessionId !== 'string') return
-    const run = state.runs.find((candidate) => candidate.status === 'running' && candidate.sessionId === sessionId)
+    const run = state.runs.find((candidate) => candidate.type !== 'business' && candidate.status === 'running' && candidate.sessionId === sessionId)
     if (run === undefined) return
     if (event.type === 'assistant/message') {
       const text = messageText(event.data?.message)
@@ -515,7 +614,9 @@ export function apply(ctx) {
     void persist()
   })
 
-  void load()
+  center.ready = load()
+  center.ready.catch((error) => console.error('[schedule-center] initialization failed:', error))
+  return center
 }
 
 /** One HTTP failure the route turns into a JSON response. */
@@ -628,7 +729,9 @@ function sanitizeState(raw) {
     const run = sanitizeRun(candidate)
     if (run !== null) state.runs.push(run)
   }
-  state.runs = state.runs.slice(0, MAX_RUNS)
+  const active = state.runs.filter((run) => run.type === 'business' && BUSINESS_ACTIVE.has(run.status))
+  const retained = state.runs.filter((run) => !(run.type === 'business' && BUSINESS_ACTIVE.has(run.status))).slice(0, MAX_RUNS)
+  state.runs = [...active, ...retained].sort((left, right) => right.startedAt - left.startedAt)
   return state
 }
 
@@ -636,7 +739,9 @@ function sanitizeState(raw) {
 function sanitizeTask(raw) {
   if (typeof raw !== 'object' || raw === null) return null
   if (typeof raw.id !== 'string' || raw.id === '') return null
-  if (typeof raw.name !== 'string' || typeof raw.prompt !== 'string') return null
+  const type = raw.type === 'business' ? 'business' : 'prompt'
+  if (typeof raw.name !== 'string' || (type === 'prompt' && typeof raw.prompt !== 'string')) return null
+  if (type === 'business' && (typeof raw.actionId !== 'string' || !/^[a-z][a-z0-9-]{0,79}$/.test(raw.actionId))) return null
   const schedule = readStoredSchedule(raw.schedule)
   if (schedule === null) return null
   const workspaceId = typeof raw.workspaceId === 'string' && raw.workspaceId !== '' ? raw.workspaceId : null
@@ -645,7 +750,9 @@ function sanitizeTask(raw) {
   return {
     id: raw.id,
     name: raw.name.slice(0, 120),
-    prompt: raw.prompt,
+    type,
+    actionId: type === 'business' ? raw.actionId : null,
+    prompt: type === 'prompt' ? raw.prompt : '',
     workspaceId,
     cwd,
     permission: typeof raw.permission === 'string' ? raw.permission : 'danger-full-access',
@@ -657,6 +764,8 @@ function sanitizeTask(raw) {
     lastRunAt: typeof raw.lastRunAt === 'number' ? raw.lastRunAt : null,
     lastStatus: typeof raw.lastStatus === 'string' ? raw.lastStatus : null,
     lastSessionId: typeof raw.lastSessionId === 'string' ? raw.lastSessionId : null,
+    lastBusinessRunId: typeof raw.lastBusinessRunId === 'string' ? raw.lastBusinessRunId : null,
+    lastOccurrenceKey: typeof raw.lastOccurrenceKey === 'string' ? raw.lastOccurrenceKey : null,
   }
 }
 
@@ -664,11 +773,24 @@ function sanitizeTask(raw) {
 function sanitizeRun(raw) {
   if (typeof raw !== 'object' || raw === null) return null
   if (typeof raw.id !== 'string' || typeof raw.taskId !== 'string') return null
-  const status = raw.status === 'success' || raw.status === 'error' || raw.status === 'running' ? raw.status : 'error'
+  const type = raw.type === 'business' ? 'business' : 'prompt'
+  const status = type === 'business'
+    ? BUSINESS_ACTIVE.has(raw.status) || BUSINESS_TERMINAL.has(raw.status) ? raw.status : 'failed'
+    : raw.status === 'success' || raw.status === 'error' || raw.status === 'running' ? raw.status : 'error'
   return {
     id: raw.id,
     taskId: raw.taskId,
     taskName: typeof raw.taskName === 'string' ? raw.taskName : '',
+    type,
+    actionId: typeof raw.actionId === 'string' ? raw.actionId : null,
+    businessRunId: typeof raw.businessRunId === 'string' ? raw.businessRunId : null,
+    projectDir: typeof raw.projectDir === 'string' ? raw.projectDir : '',
+    occurrenceKey: typeof raw.occurrenceKey === 'string' ? raw.occurrenceKey : `schedule-center:legacy:${raw.id}`,
+    stages: raw.stages && typeof raw.stages === 'object' ? raw.stages : null,
+    reportUrl: typeof raw.reportUrl === 'string' ? raw.reportUrl : null,
+    errorCode: typeof raw.errorCode === 'string' ? raw.errorCode : null,
+    awaitingAction: raw.awaitingAction === true,
+    lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : null,
     trigger: raw.trigger === 'manual' ? 'manual' : 'schedule',
     startedAt: typeof raw.startedAt === 'number' ? raw.startedAt : Date.now(),
     finishedAt: typeof raw.finishedAt === 'number' ? raw.finishedAt : null,
